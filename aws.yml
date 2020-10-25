@@ -1,0 +1,190 @@
+---
+- hosts: localhost
+  connection: local
+  tasks:
+
+    - name: Creating a VPC
+      ec2_vpc_net:
+        name: "{{ VPC_NAME }}"
+        cidr_block: "{{ VPC_CIDR }}"
+        region: "{{ REGION }}"
+      register: VPC
+    
+    - name: Getting VPC id to be used for later
+      set_fact:
+        vpc_id: "{{ VPC.vpc.id }}"
+    
+# Creating public subntet in VPC    
+    - name: Creating public subnet
+      ec2_vpc_subnet:
+        state: present
+        vpc_id: "{{ vpc_id }}"
+        cidr: "{{ PUBLIC_CIDR }}"
+        region: "{{ REGION }}"
+        az: "{{ AZ1 }}"
+        tags:
+            Name: "{{ PUBLIC_SUBNET_NAME }}"
+      register: public_subnet
+    
+    - name: Getting public subnet id to be used for route table
+      set_fact: 
+        public_id: "{{ public_subnet.subnet.id }}"
+
+# Creating a private subnet in the VPC in one AZ
+    - name: Creating private subnet a
+      ec2_vpc_subnet:
+        state: present
+        vpc_id: "{{ vpc_id }}"
+        cidr: "{{ PRIVATE_CIDR_A }}"
+        region: "{{ REGION }}"
+        az: "{{ AZ1 }}"
+        tags:
+          Name: "{{ PRIVATE_SUBNET_NAME_A }}"
+      register: private_subnet_a
+    
+    - name: Getting private subnet_id for private subnet a
+      set_fact:
+        private_id_a: "{{ private_subnet_a.subnet.id }}"
+
+# Creating another private subnet in VPC in a different AZ
+    - name: Creating private subnet b
+      ec2_vpc_subnet:
+        state: present
+        vpc_id: "{{ vpc_id }}"
+        cidr: "{{ PRIVATE_CIDR_B }}"
+        region: "{{ REGION }}"
+        az: "{{ AZ2 }}"
+        tags:
+          Name: "{{ PRIVATE_SUBNET_NAME_B }}"
+      register: private_subnet_b
+    
+    - name: Getting private subnet_id for private subnet b
+      set_fact:
+        private_id_b: "{{ private_subnet_b.subnet.id }}"
+  
+# Creating Internet Gateway
+    - name: Create Internet Gateway
+      ec2_vpc_igw:
+        vpc_id: "{{ vpc_id }}"
+        state: present
+        region: "{{ REGION }}"
+        tags:
+          Name: "{{ IGW_NAME }}"
+      register: IGW
+    
+    - name: Getting IGW ID
+      set_fact:
+        igw_id: "{{ IGW.gateway_id }}"
+    
+# Creating public route table
+    - name: Public Route table
+      ec2_vpc_route_table:
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ REGION }}"
+        tags:
+            Name: "{{ PUBLIC_RT_NAME }}"
+        subnets:
+            - "{{ public_id }}"
+        routes:
+            - dest: 0.0.0.0/0
+              gateway_id: "{{ igw_id }}"
+
+# Creating private route table
+    - name:
+      ec2_vpc_route_table:
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ REGION }}"
+        tags:
+            Name: "{{ PRIVATE_RT_NAME }}"
+        subnets:
+            - "{{ private_id_a }}"
+            - "{{ private_id_b }}"
+        routes:
+          - dest: "{{ VPC_CIDR }}"
+
+# Creating Security group for ec2 instance
+    - name: Security group for webservers. Opening port 80 and 22
+      ec2_group:
+        name: "{{ EC2_SG_NAME }}"
+        description: webserver
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ REGION }}"
+        rules:
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: "{{ SOURCE_IP }}"
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: "{{ SOURCE_IP }}"
+        tags:
+          Name: "{{ EC2_SG_NAME }}" 
+      register: web_sg
+    
+    - name: Getting group name
+      set_fact:
+        websg_name: "{{ web_sg.group_name }}"
+
+# Creating ec2 instance
+    - name: Creating ec2 instance
+      ec2:
+        key_name: "{{ KEY }}"
+        instance_type: "{{ EC2_TYPE }}"
+        image: "{{ EC2_IMAGE }}"
+        wait: yes
+        count: "{{ COUNT }}"
+        region: "{{ REGION }}"
+        vpc_subnet_id: "{{ public_id }}"
+        group_id: "{{ web_sg.group_id }}"
+        instance_tags:
+          Name: "{{ EC2_NAME }}"
+
+# Creating Security Group for rds
+    - name: Security Group for RDS 
+      ec2_group:
+        name: "{{ RDS_SECURITY_GROUP_NAME }}"
+        description: Security Group For RDS
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ REGION }}"
+        rules:
+          - proto: tcp
+            from_port: "{{ RDS_PORT }}"
+            to_port: "{{ RDS_PORT }}"
+            group_name: "{{ websg_name }}"
+      register: rdssg
+    
+    - name: Getting the Security group id
+      set_fact:
+        rds_sg_id: "{{ rdssg.group_id }}"
+
+# Creating RDS subnet group
+    - name: RDS subnet group
+      rds_subnet_group:
+        state: present
+        name: "{{ RDS_SUBNET_GROUP_NAME }}"
+        region: "{{ REGION }}"
+        description: RDS group for Testing
+        subnets:
+          - "{{ private_id_a }}"
+          - "{{ private_id_b }}"
+      register: rds_sub_group
+      
+    - name: Getting the rds subnet group name
+      set_fact:
+        rds_subnet_name: "{{ rds_sub_group.subnet_group.name }}"
+    
+    - name: Creating RDS instance
+      rds_instance:
+        state: present
+        engine: "{{ RDS_ENGINE }}"
+        db_instance_identifier: "{{ RDS_NAME }}"
+        instance_type: "{{ RDS_TYPE }}"
+        username: "{{ RDS_USER_NAME }}"
+        password: "{{ RDS_PASSWORD }}"
+        multi_az: no
+        subnet_group: "{{ rds_subnet_name }}"
+        region: "{{ REGION }}"
+        vpc_security_group_ids: "{{ rds_sg_id }}"
+        allocated_storage: 100
+        wait: no
